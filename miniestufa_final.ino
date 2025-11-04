@@ -18,7 +18,6 @@ PubSubClient client(espClient);
 #define DHTPIN 4
 #define DHTTYPE DHT22
 DHT dht(DHTPIN, DHTTYPE);
-
 const int sensorUmidade = 34;  // Solo (ADC)
 const int sensorLDR     = 33;  // Luminosidade (ADC)
 
@@ -27,7 +26,7 @@ const int motorAIN1 = 25;
 const int motorAIN2 = 27;
 
 // ---- Luz grow (MOSFET IRLZ44N) ----
-const int PIN_LED_GROW = 23;   // gate do MOSFET
+const int PIN_LED_GROW = 23;   // Gate do MOSFET
 
 // ---- Calibração ----
 const int seco   = 2200; // Solo seco
@@ -35,25 +34,24 @@ const int molhado= 910;  // Solo molhado
 const int ldrMin = 0;
 const int ldrMax = 4095;
 
-// ---- NTP (hora local) ----
+// ---- NTP ----
 const char* ntpServer = "pool.ntp.org";
-const long gmtOffset_sec = -3 * 3600; // Brasília (UTC-3)
+const long gmtOffset_sec = -3 * 3600; // UTC-3
 const int  daylightOffset_sec = 0;
 
 // ---- Controle ----
 bool bombaLigada = false;
 unsigned long tempoInicioBomba = 0;
-const unsigned long duracaoBomba   = 3000;    // 3 s
-const unsigned long intervaloEnvio = 60000;  // 10 min
+const unsigned long duracaoBomba   = 2000;    // 2 s
+const unsigned long intervaloEnvio = 600000;   // 10 min
 unsigned long ultimoEnvio = 0;
 int umidadeAnterior = 100;
 
-// ---- Janela da luz grow (12:00–22:00) ----
+// ---- Luz grow (12h–22h) ----
 bool luzLigada = false;
 const int horaOn  = 12;
 const int horaOff = 22;
 
-// Utilitário: data/hora "dd/mm/aaaa HH:MM:SS"
 String agoraStr() {
   struct tm t;
   if (!getLocalTime(&t)) return "Sem hora";
@@ -62,15 +60,12 @@ String agoraStr() {
   return String(buf);
 }
 
-// Publicação centralizada no único tópico
 void publishJSON(const String& payload) {
   client.publish(TOPICO, payload.c_str());
   Serial.println("MQTT -> " + String(TOPICO) + ": " + payload);
 }
 
 void setup_wifi() {
-  delay(100);
-  Serial.println();
   Serial.print("Conectando a "); Serial.println(ssid);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
@@ -86,7 +81,6 @@ void reconnect() {
     String clientId = "ESP32Client-" + String(random(0xffff), HEX);
     if (client.connect(clientId.c_str())) {
       Serial.println(" conectado!");
-      // Opcional: anunciar conexão como evento no mesmo tópico
       String p = String("{\"data_hora\":\"") + agoraStr() +
                  "\",\"tipo\":\"evento\",\"evento\":\"ESP32 online\"}";
       publishJSON(p);
@@ -98,21 +92,33 @@ void reconnect() {
   }
 }
 
-// Liga/desliga a luz grow conforme janela 12:00–22:00, publicando evento na troca
+// --- Luz grow controlada por horário (real)
 void atualizaLuzGrowPorHorario() {
   struct tm t;
   if (!getLocalTime(&t)) return;
-  const int h = t.tm_hour;
-
+  int h = t.tm_hour;
   bool deveLigar = (h >= horaOn && h < horaOff);
-  if (deveLigar != luzLigada) {
-    luzLigada = deveLigar;
-    digitalWrite(PIN_LED_GROW, luzLigada ? HIGH : LOW);
 
+  if (deveLigar && !luzLigada) {
+    digitalWrite(PIN_LED_GROW, HIGH);
+    luzLigada = true;
     String evento = String("{\"data_hora\":\"") + agoraStr() +
-                    "\",\"tipo\":\"evento\",\"evento\":\"Luz grow " +
-                    (luzLigada ? "ligada" : "desligada") + "\"}";
+                    "\",\"tipo\":\"evento\",\"evento\":\"Luz grow ligada\"}";
     publishJSON(evento);
+  } else if (!deveLigar && luzLigada) {
+    digitalWrite(PIN_LED_GROW, LOW);
+    luzLigada = false;
+    String evento = String("{\"data_hora\":\"") + agoraStr() +
+                    "\",\"tipo\":\"evento\",\"evento\":\"Luz grow desligada\"}";
+    publishJSON(evento);
+  }
+
+  // Validação: se deveria estar ligada mas está off fisicamente
+  int estadoReal = digitalRead(PIN_LED_GROW);
+  if (deveLigar && estadoReal == LOW) {
+    String alerta = String("{\"data_hora\":\"") + agoraStr() +
+                    "\",\"tipo\":\"alerta\",\"alerta\":\"Luz programada para ligada, mas está desligada\"}";
+    publishJSON(alerta);
   }
 }
 
@@ -120,16 +126,15 @@ void setup() {
   Serial.begin(115200);
   dht.begin();
 
-  // bomba
+  // Configura bomba
   pinMode(motorAIN1, OUTPUT);
   pinMode(motorAIN2, OUTPUT);
   digitalWrite(motorAIN1, LOW);
   digitalWrite(motorAIN2, LOW);
 
-  // luz grow
+  // Configura luz grow
   pinMode(PIN_LED_GROW, OUTPUT);
   digitalWrite(PIN_LED_GROW, LOW);
-  luzLigada = false;
 
   setup_wifi();
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
@@ -140,29 +145,26 @@ void loop() {
   if (!client.connected()) reconnect();
   client.loop();
 
-  // Atualiza luz grow por horário (e publica evento se mudar)
   atualizaLuzGrowPorHorario();
 
   unsigned long agora = millis();
 
-  // Envio periódico das leituras (único tópico)
+  // --- Leitura e envio periódico ---
   if (agora - ultimoEnvio > intervaloEnvio) {
     ultimoEnvio = agora;
 
-    // Leituras
     float temperatura = dht.readTemperature();
     float umidadeAr   = dht.readHumidity();
-    int   valorLDR    = analogRead(sensorLDR);
-    int   valorSoloADC= analogRead(sensorUmidade);
+    int valorLDR      = analogRead(sensorLDR);
+    int valorSoloADC  = analogRead(sensorUmidade);
 
-    // Processamento
     int umidadeSolo = map(valorSoloADC, seco, molhado, 0, 100);
     umidadeSolo = constrain(umidadeSolo, 0, 100);
 
     int luminosidade = map(valorLDR, ldrMin, ldrMax, 0, 100);
     luminosidade = constrain(luminosidade, 0, 100);
 
-    // Lógica da bomba (evento só na transição)
+    // --- Lógica da bomba ---
     if (umidadeSolo <= 30 && umidadeAnterior > 30 && !bombaLigada) {
       Serial.println("Umidade crítica. Ligando bomba...");
       digitalWrite(motorAIN1, HIGH);
@@ -177,11 +179,9 @@ void loop() {
     }
     umidadeAnterior = umidadeSolo;
 
-    // Status atuais
     String statusBomba = bombaLigada ? "Bomba ativada" : "Bomba desativada";
-    String statusLuz   = luzLigada   ? "Luz ligada"     : "Luz desligada";
+    String statusLuz   = digitalRead(PIN_LED_GROW) ? "Luz ligada" : "Luz desligada";
 
-    // Publica leitura periódica (único tópico)
     String leitura = String("{\"data_hora\":\"") + agoraStr() + "\"" +
                      ",\"tipo\":\"leituras\"" +
                      ",\"temperatura\":" + String(temperatura, 1) +
@@ -193,7 +193,7 @@ void loop() {
     publishJSON(leitura);
   }
 
-  // Desliga bomba após 3 s (e publica evento)
+  // --- Desliga bomba após tempo configurado ---
   if (bombaLigada && millis() - tempoInicioBomba > duracaoBomba) {
     digitalWrite(motorAIN1, LOW);
     digitalWrite(motorAIN2, LOW);
