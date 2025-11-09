@@ -42,7 +42,7 @@ const int  daylightOffset_sec = 0;
 // ---- Controle ----
 bool bombaLigada = false;
 unsigned long tempoInicioBomba = 0;
-const unsigned long duracaoBomba   = 2000;    // 2 s
+const unsigned long duracaoBomba   = 2000;     // 2 s
 const unsigned long intervaloEnvio = 600000;   // 10 min
 unsigned long ultimoEnvio = 0;
 int umidadeAnterior = 100;
@@ -156,7 +156,7 @@ void loop() {
     float temperatura = dht.readTemperature();
     float umidadeAr   = dht.readHumidity();
     int valorLDR      = analogRead(sensorLDR);
-    int valorSoloADC  = analogRead(sensorUmidade);
+    int valorSoloADC  = analogRead(sensorUmidade);   // <-- SOLO BRUTO (ADC)
 
     int umidadeSolo = map(valorSoloADC, seco, molhado, 0, 100);
     umidadeSolo = constrain(umidadeSolo, 0, 100);
@@ -172,9 +172,11 @@ void loop() {
       bombaLigada = true;
       tempoInicioBomba = millis();
 
+      // Evento com solo bruto
       String e = String("{\"data_hora\":\"") + agoraStr() +
-                 "\",\"tipo\":\"evento\",\"evento\":\"Bomba ativada\",\"umidade_solo\":" +
-                 String(umidadeSolo) + "}";
+                 "\",\"tipo\":\"evento\",\"evento\":\"Bomba ativada\"" +
+                 ",\"umidade_solo\":" + String(umidadeSolo) +
+                 ",\"solo_bruto\":"   + String(valorSoloADC) + "}";
       publishJSON(e);
     }
     umidadeAnterior = umidadeSolo;
@@ -182,12 +184,14 @@ void loop() {
     String statusBomba = bombaLigada ? "Bomba ativada" : "Bomba desativada";
     String statusLuz   = digitalRead(PIN_LED_GROW) ? "Luz ligada" : "Luz desligada";
 
+    // Leitura periódica com solo bruto
     String leitura = String("{\"data_hora\":\"") + agoraStr() + "\"" +
                      ",\"tipo\":\"leituras\"" +
-                     ",\"temperatura\":" + String(temperatura, 1) +
-                     ",\"umidade_ar\":"  + String(umidadeAr, 1) +
-                     ",\"luminosidade\":" + String(luminosidade) +
-                     ",\"umidade_solo\":" + String(umidadeSolo) +
+                     ",\"temperatura\":"   + String(temperatura, 1) +
+                     ",\"umidade_ar\":"    + String(umidadeAr, 1) +
+                     ",\"luminosidade\":"  + String(luminosidade) +
+                     ",\"umidade_solo\":"  + String(umidadeSolo) +
+                     ",\"solo_bruto\":"    + String(valorSoloADC) +
                      ",\"status_bomba\":\"" + statusBomba + "\"" +
                      ",\"status_luz\":\""   + statusLuz   + "\"}";
     publishJSON(leitura);
