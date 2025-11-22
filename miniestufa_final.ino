@@ -6,13 +6,13 @@
 #include "time.h"
 
 // ---- Wi-Fi ----
-const char* ssid = "Ruzin_2.4g";
+const char* ssid = "Rude";
 const char* password = "eu29192313";
 
 // ---- MQTT local (opcional) ----
-const char* mqtt_server = "192.168.18.27";
+const char* mqtt_server = "192.168.217.100";
 const int   mqtt_port   = 1883;
-const char* TOPICO      = "sensores/estufa";
+const char* TOPICO      = "sensores/estufa"; // leitura/telemetria
 WiFiClient espClient;
 PubSubClient client(espClient);
 
@@ -39,15 +39,15 @@ const int molhado= 910;  // Solo molhado
 const int ldrMin = 0;
 const int ldrMax = 4095;
 
-// ---- NTP ----
+// ---- NTP: configurar para UTC (offset 0) ----
 const char* ntpServer = "pool.ntp.org";
-const long gmtOffset_sec = -3 * 3600; // UTC-3
+const long gmtOffset_sec = 0; // <-- UTC
 const int  daylightOffset_sec = 0;
 
 // ---- Controle ----
 bool bombaLigada = false;
 unsigned long tempoInicioBomba = 0;
-const unsigned long duracaoBomba   = 2000;     // 2 s
+const unsigned long duracaoBomba   = 2000;     // 2 s (padrão)
 const unsigned long intervaloEnvio = 600000;   // 10 min (para testar rápido, use 30000)
 unsigned long ultimoEnvio = 0;
 int umidadeAnterior = 100;
@@ -57,46 +57,132 @@ bool luzLigada = false;
 const int horaOn  = 12;
 const int horaOff = 22;
 
+// ---- Identificador do dispositivo (para tópicos MQTT) ----
+String dispositivoId;
+
+// variáveis para controlar duração customizada vinda do broker
+unsigned long globalDuracaoBomba = duracaoBomba;
+
 // ---------- Utilidades de data/hora ----------
-String agoraStrDDMMYYYY() { // se quiser registrar eventos no MQTT
+// Retorna timestamp em UTC no formato ISO 8601 (ex.: 2025-11-22T14:30:00Z)
+String agoraISO8601UTC() {
   struct tm t;
-  if (!getLocalTime(&t)) return "Sem hora";
-  char buf[20];
+  if (!getLocalTime(&t)) return "SemHora";
+  char buf[30];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &t);
+  return String(buf);
+}
+
+// Formato legível dd/mm/yyyy hh:mm:ss (UTC)
+String agoraStrDDMMYYYY() {
+  struct tm t;
+  if (!getLocalTime(&t)) return "SemHora";
+  char buf[25];
   strftime(buf, sizeof(buf), "%d/%m/%Y %H:%M:%S", &t);
   return String(buf);
 }
 
-String agoraStrYYYYMMDD() { // formato esperado pelo backend (ex.: 2025/11/09 17:30:00)
-  struct tm t;
-  if (!getLocalTime(&t)) return "Sem hora";
-  char buf[20];
-  strftime(buf, sizeof(buf), "%Y/%m/%d %H:%M:%S", &t);
-  return String(buf);
-}
-
 // ---------- MQTT helpers ----------
-void publishJSON(const String& payload) {
-  client.publish(TOPICO, payload.c_str());
-  Serial.println("MQTT -> " + String(TOPICO) + ": " + payload);
+void publishJSON(const String& topic, const String& payload) {
+  client.publish(topic.c_str(), payload.c_str());
+  Serial.println("MQTT -> " + topic + ": " + payload);
 }
 
-void setup_wifi() {
-  Serial.print("Conectando a "); Serial.println(ssid);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) { delay(1000); Serial.print("."); }
-  Serial.println("\nWiFi conectado");
-  Serial.print("IP: "); Serial.println(WiFi.localIP());
+// Callback MQTT: recebe comandos da Raspberry Pi/IA no tópico estufa/controle
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+
+  Serial.println("MQTT recv topic: " + String(topic) + " payload: " + msg);
+
+  // ------- COMANDO DE BOMBA -------
+  if (msg.indexOf("\"cmd\":\"bomba\"") >= 0) {
+
+    // LIGAR
+    if (msg.indexOf("\"action\":\"on\"") >= 0) {
+
+      unsigned long dur = duracaoBomba; // padrão
+      int p = msg.indexOf("duration_ms");
+      if (p >= 0) {
+        int colon = msg.indexOf(':', p);
+        if (colon >= 0) {
+          // encontrar fim do número
+          int comma = msg.indexOf(',', colon);
+          int endbr = msg.indexOf('}', colon);
+          int endpos = (comma >= 0 && comma < endbr) ? comma : endbr;
+          if (endpos > colon) {
+            String sdur = msg.substring(colon+1, endpos);
+            sdur.trim();
+            unsigned long tmp = (unsigned long) sdur.toInt();
+            if (tmp > 0) dur = tmp;
+          }
+        }
+      }
+
+      Serial.println("IA -> LIGAR bomba por " + String(dur) + " ms");
+
+      digitalWrite(motorAIN1, HIGH);
+      digitalWrite(motorAIN2, LOW);
+      bombaLigada = true;
+      tempoInicioBomba = millis();
+      globalDuracaoBomba = dur;
+
+      // ACK
+      publishJSON("estufa/controle/resposta",
+        "{\"ok\":true,\"cmd\":\"bomba_on\",\"duration_ms\":" + String(dur) + "}"
+      );
+
+      return;
+    }
+
+    // DESLIGAR
+    if (msg.indexOf("\"action\":\"off\"") >= 0) {
+      Serial.println("IA -> DESLIGAR bomba");
+
+      digitalWrite(motorAIN1, LOW);
+      digitalWrite(motorAIN2, LOW);
+      bombaLigada = false;
+
+      publishJSON("estufa/controle/resposta",
+        "{\"ok\":true,\"cmd\":\"bomba_off\"}"
+      );
+
+      return;
+    }
+  }
+
+  // ------- COMANDO DE LUZ -------
+  if (msg.indexOf("\"cmd\":\"luz\"") >= 0) {
+    if (msg.indexOf("\"action\":\"on\"") >= 0) {
+      digitalWrite(PIN_LED_GROW, HIGH);
+      luzLigada = true;
+      publishJSON("estufa/controle/resposta","{\"ok\":true,\"cmd\":\"luz_on\"}");
+      return;
+    }
+    if (msg.indexOf("\"action\":\"off\"") >= 0) {
+      digitalWrite(PIN_LED_GROW, LOW);
+      luzLigada = false;
+      publishJSON("estufa/controle/resposta","{\"ok\":true,\"cmd\":\"luz_off\"}");
+      return;
+    }
+  }
 }
 
+// reconecta e se inscreve no tópico estufa/controle
 void reconnect() {
   while (!client.connected()) {
     Serial.print("Conectando ao broker MQTT...");
     String clientId = "ESP32Client-" + String(random(0xffff), HEX);
     if (client.connect(clientId.c_str())) {
       Serial.println(" conectado!");
+      // publicar evento online
       String p = String("{\"data_hora\":\"") + agoraStrDDMMYYYY() +
                  "\",\"tipo\":\"evento\",\"evento\":\"ESP32 online\"}";
-      publishJSON(p);
+      publishJSON(TOPICO, p);
+
+      // inscrever no tópico de comando
+      client.subscribe("estufa/controle");
+      Serial.println("Inscrito em: estufa/controle");
     } else {
       Serial.print(" falhou, rc="); Serial.print(client.state());
       Serial.println(" tentando em 5s...");
@@ -109,29 +195,29 @@ void reconnect() {
 void atualizaLuzGrowPorHorario() {
   struct tm t;
   if (!getLocalTime(&t)) return;
-  int h = t.tm_hour;
+  int h = t.tm_hour; // UTC hour
   bool deveLigar = (h >= horaOn && h < horaOff);
 
   if (deveLigar && !luzLigada) {
     digitalWrite(PIN_LED_GROW, HIGH);
     luzLigada = true;
-    String evento = String("{\"data_hora\":\"") + agoraStrDDMMYYYY() +
+    String evento = String("{\"data_hora\":\"") + agoraISO8601UTC() +
                     "\",\"tipo\":\"evento\",\"evento\":\"Luz grow ligada\"}";
-    publishJSON(evento);
+    publishJSON(TOPICO, evento);
   } else if (!deveLigar && luzLigada) {
     digitalWrite(PIN_LED_GROW, LOW);
     luzLigada = false;
-    String evento = String("{\"data_hora\":\"") + agoraStrDDMMYYYY() +
+    String evento = String("{\"data_hora\":\"") + agoraISO8601UTC() +
                     "\",\"tipo\":\"evento\",\"evento\":\"Luz grow desligada\"}";
-    publishJSON(evento);
+    publishJSON(TOPICO, evento);
   }
 
   // Validação física opcional
   int estadoReal = digitalRead(PIN_LED_GROW);
   if (deveLigar && estadoReal == LOW) {
-    String alerta = String("{\"data_hora\":\"") + agoraStrDDMMYYYY() +
+    String alerta = String("{\"data_hora\":\"") + agoraISO8601UTC() +
                     "\",\"tipo\":\"alerta\",\"alerta\":\"Luz programada para ligada, mas está desligada\"}";
-    publishJSON(alerta);
+    publishJSON(TOPICO, alerta);
   }
 }
 
@@ -171,11 +257,27 @@ void setup() {
   pinMode(PIN_LED_GROW, OUTPUT);
   digitalWrite(PIN_LED_GROW, LOW);
 
-  setup_wifi();
+  // id do dispositivo baseado no MAC (remove ':')
+  // Note: para garantir que WiFi.macAddress() funcione, conectamos à rede primeiro
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando a ");
+  Serial.println(ssid);
+  int wifi_tries = 0;
+  while (WiFi.status() != WL_CONNECTED && wifi_tries < 40) { delay(250); Serial.print("."); wifi_tries++; }
+  if (WiFi.status() == WL_CONNECTED) {
+    dispositivoId = WiFi.macAddress();
+    dispositivoId.replace(":", "");
+    Serial.println("\nDeviceId: " + dispositivoId);
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nFalha ao conectar WiFi na setup (continuando, pode reconectar depois)");
+    dispositivoId = "unknown";
+  }
 
-  // NTP antes de TLS
+  // NTP antes de TLS: configurar para UTC
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  Serial.print("Sincronizando NTP");
+  Serial.print("Sincronizando NTP (UTC)");
   time_t now = time(nullptr);
   int tries = 0;
   while (now < 8 * 3600 * 2 && tries < 30) {
@@ -184,9 +286,10 @@ void setup() {
     now = time(nullptr);
     tries++;
   }
-  Serial.println("\nHora atual: " + String(ctime(&now)));
+  Serial.println("\nHora atual (UTC): " + String(ctime(&now)));
 
   client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqttCallback);
 }
 
 void loop() {
@@ -212,34 +315,34 @@ void loop() {
     int luminosidade = map(valorLDR, ldrMin, ldrMax, 0, 100);
     luminosidade = constrain(luminosidade, 0, 100);
 
-    // --- Lógica da bomba ---
+    // --- Lógica local da bomba (habilita só se IA não enviar comando) ---
     if (umidadeSolo <= 30 && umidadeAnterior > 30 && !bombaLigada) {
-      Serial.println("Umidade crítica. Ligando bomba...");
+      Serial.println("Umidade crítica. Ligando bomba (lógica local)...");
       digitalWrite(motorAIN1, HIGH);
       digitalWrite(motorAIN2, LOW);
       bombaLigada = true;
       tempoInicioBomba = millis();
+      globalDuracaoBomba = duracaoBomba; // usar padrão
 
-      // Evento via MQTT (opcional)
-      String e = String("{\"data_hora\":\"") + agoraStrDDMMYYYY() +
-                 "\",\"tipo\":\"evento\",\"evento\":\"Bomba ativada\"" +
+      String e = String("{\"data_hora\":\"") + agoraISO8601UTC() +
+                 "\",\"tipo\":\"evento\",\"evento\":\"Bomba ativada (local)\"" +
                  ",\"umidade_solo\":" + String(umidadeSolo) +
                  ",\"solo_bruto\":"   + String(valorSoloADC) + "}";
-      publishJSON(e);
+      publishJSON(TOPICO, e);
     }
     umidadeAnterior = umidadeSolo;
 
     String statusBomba = bombaLigada ? "Bomba ativada" : "Bomba desativada";
     String statusLuz   = digitalRead(PIN_LED_GROW) ? "Luz ligada" : "Luz desligada";
 
-    // ---------- Payload para o BACKEND (igual ao curl que funcionou) ----------
+    // ---------- Payload para o BACKEND (ISO UTC) ----------
     String payloadBackend = String("{") +
-      "\"data_hora\":\""         + agoraStrYYYYMMDD() + "\"," +
+      "\"data_hora\":\""         + agoraISO8601UTC() + "\"," +
       "\"temperatura\":"         + String(temperatura, 1) + "," +
       "\"umidade_ar\":"          + String(umidadeAr, 1) + "," +
       "\"luminosidade\":"        + String(luminosidade) + "," +
       "\"umidade_solo\":"        + String(umidadeSolo) + "," +
-      "\"umidade_solo_bruto\":"  + String(valorSoloADC) + "," +   // <- nome certo!
+      "\"umidade_solo_bruto\":"  + String(valorSoloADC) + "," +
       "\"status_luz\":\""        + statusLuz + "\"," +
       "\"status_bomba\":\""      + statusBomba + "\"" +
     "}";
@@ -248,7 +351,7 @@ void loop() {
     bool ok = postLeituraNoBackend(payloadBackend);
 
     // (Opcional) também publica no MQTT local para logging/histórico interno
-    String leituraMQTT = String("{\"data_hora\":\"") + agoraStrDDMMYYYY() + "\"" +
+    String leituraMQTT = String("{\"data_hora\":\"") + agoraISO8601UTC() + "\"" +
                      ",\"tipo\":\"leituras\"" +
                      ",\"temperatura\":"   + String(temperatura, 1) +
                      ",\"umidade_ar\":"    + String(umidadeAr, 1) +
@@ -259,18 +362,20 @@ void loop() {
                      ",\"status_luz\":\""   + statusLuz   + "\"" +
                      ",\"post_backend\":"   + String(ok ? "true" : "false") +
                      "}";
-    publishJSON(leituraMQTT);
+    publishJSON(TOPICO, leituraMQTT);
   }
 
   // --- Desliga bomba após tempo configurado ---
-  if (bombaLigada && millis() - tempoInicioBomba > duracaoBomba) {
+  if (bombaLigada && millis() - tempoInicioBomba > globalDuracaoBomba) {
     digitalWrite(motorAIN1, LOW);
     digitalWrite(motorAIN2, LOW);
     bombaLigada = false;
 
-    String e = String("{\"data_hora\":\"") + agoraStrDDMMYYYY() +
+    String e = String("{\"data_hora\":\"") + agoraISO8601UTC() +
                "\",\"tipo\":\"evento\",\"evento\":\"Bomba desativada\"}";
-    publishJSON(e);
+    publishJSON(TOPICO, e);
     Serial.println("Bomba desativada.");
+    // reset duracao para padrão
+    globalDuracaoBomba = duracaoBomba;
   }
 }
